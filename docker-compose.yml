@@ -1,0 +1,136 @@
+version: '3.8'
+
+services:
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: techlab-rabbitmq
+    ports:
+      - "5672:5672"   # AMQP protocol port
+      - "15672:15672" # Management Web UI
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_running"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: techlab-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: techlab_db
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d techlab_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  order-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: npm run start:order
+    ports:
+      - "3001:3001"
+    environment:
+      - ORDER_SERVICE_PORT=3001
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/techlab_db
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
+      - PAYMENT_SERVICE_URL=http://payment-service:3002
+      - INVENTORY_SERVICE_URL=http://inventory-service:3003
+      - NOTIFICATION_SERVICE_URL=http://notification-service:3004
+      - ANALYTICS_SERVICE_URL=http://analytics-service:3005
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  payment-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: npm run start:payment
+    ports:
+      - "3002:3002"
+    environment:
+      - PAYMENT_SERVICE_PORT=3002
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/techlab_db
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
+      - PAYMENT_FAILURE_RATE=0.2
+      - PAYMENT_LATENCY_MS=1000
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  inventory-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: npm run start:inventory
+    ports:
+      - "3003:3003"
+    environment:
+      - INVENTORY_SERVICE_PORT=3003
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/techlab_db
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: npm run start:notification
+    ports:
+      - "3004:3004"
+    environment:
+      - NOTIFICATION_SERVICE_PORT=3004
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  analytics-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: npm run start:analytics
+    ports:
+      - "3005:3005"
+    environment:
+      - ANALYTICS_SERVICE_PORT=3005
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: npm run start:gateway
+    ports:
+      - "3000:3000"
+    environment:
+      - API_GATEWAY_PORT=3000
+      - ORDER_SERVICE_URL=http://order-service:3001
+      - INVENTORY_SERVICE_URL=http://inventory-service:3003
+      - ANALYTICS_SERVICE_URL=http://analytics-service:3005
+      - API_AUTH_TOKEN=techlab-secret-token-2026
+      - RATE_LIMIT_MAX_REQUESTS=2000
+    depends_on:
+      - order-service
+      - inventory-service
+      - analytics-service
