@@ -1,5 +1,7 @@
 # Techlab Dev Interview 2026 — RabbitMQ Asynchronous Architecture for E-commerce Microservices
 
+> 📄 **Báo cáo kỹ thuật chi tiết (Solution Report)**: Vui lòng xem tài liệu đầy đủ tại **[SOLUTION_REPORT.md](./SOLUTION_REPORT.md)**.
+> 
 > **Mục tiêu**: Báo cáo kỹ thuật, chứng minh thực nghiệm và hiện thực hóa kiến trúc Microservices hướng sự kiện (EDA) sử dụng **RabbitMQ**, **PostgreSQL**, **API Gateway**, **Transactional Outbox**, và **Saga Choreography** giải quyết triệt để các vấn đề về độ trễ, nghẽn cổ chai và tính toàn vẹn dữ liệu dưới tải cao.
 
 ---
