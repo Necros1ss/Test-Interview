@@ -35,8 +35,25 @@ const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000
 const RATE_LIMIT_MAX_REQUESTS = parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '2000', 10);
 const requestTimestamps = new Map();
 
+// Periodic self-cleaning background task to prevent memory leaks from inactive client IPs
+const rateLimitCleanupTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [clientKey, timestamps] of requestTimestamps.entries()) {
+    const active = timestamps.filter((ts) => now - ts < RATE_LIMIT_WINDOW_MS);
+    if (active.length === 0) {
+      requestTimestamps.delete(clientKey);
+    } else {
+      requestTimestamps.set(clientKey, active);
+    }
+  }
+}, Math.min(RATE_LIMIT_WINDOW_MS, 60000));
+
+if (rateLimitCleanupTimer.unref) {
+  rateLimitCleanupTimer.unref();
+}
+
 function rateLimiter(req, res, next) {
-  const clientKey = req.ip || req.headers['x-forwarded-for'] || 'default-client';
+  const clientKey = req.ip || req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'default-client';
   const now = Date.now();
 
   let timestamps = requestTimestamps.get(clientKey) || [];

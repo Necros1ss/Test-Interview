@@ -1,213 +1,166 @@
 # Techlab Dev Interview 2026 — RabbitMQ Asynchronous Architecture for E-commerce Microservices
 
-> 📄 **Báo cáo kỹ thuật chi tiết (Solution Report)**: Vui lòng xem tài liệu đầy đủ tại **[SOLUTION_REPORT.md](./SOLUTION_REPORT.md)**.
-> 
-> **Mục tiêu**: Báo cáo kỹ thuật, chứng minh thực nghiệm và hiện thực hóa kiến trúc Microservices hướng sự kiện (EDA) sử dụng **RabbitMQ**, **PostgreSQL**, **API Gateway**, **Transactional Outbox**, và **Saga Choreography** giải quyết triệt để các vấn đề về độ trễ, nghẽn cổ chai và tính toàn vẹn dữ liệu dưới tải cao.
+Dự án hiện thực hóa kiến trúc Microservices hướng sự kiện (**Event-Driven Architecture**) sử dụng **RabbitMQ**, **Node.js**, **PostgreSQL** và **Kubernetes**, giải quyết triệt để bài toán về độ trễ cao, nghẽn cổ chai downstream và bảo vệ toàn vẹn dữ liệu kho hàng dưới tải lớn cho sàn thương mại điện tử Techlab.
 
 ---
 
-## 1. Bài Toán & Bối Cảnh (Problem Statement)
+## 1. Sơ Lược Hướng Giải Quyết (Solution Overview)
 
-Hệ thống E-commerce Techlab gồm 6 dịch vụ thành phần:
-1. **API Gateway**: Expose REST APIs, xử lý Authentication (Bearer Token) và Rate Limiting chống spam/DDoS.
-2. **Order Service**: Tiếp nhận đơn hàng, lưu trữ dữ liệu vào database và phản hồi nhanh cho client mà không bị downstream block.
-3. **Payment Service**: Xử lý cổng thanh toán, có độ trễ cao (~1.0s) hoặc lỗi ngẫu nhiên, yêu cầu cơ chế Retry tự động.
-4. **Inventory Service**: Cập nhật tồn kho, nhạy cảm với Race Condition dưới tải đồng thời cao (High Concurrency).
-5. **Notification Service**: Gửi Email/Push bất đồng bộ, không yêu cầu real-time nghiêm ngặt.
-6. **Analytics Service**: Thu thập các business events cho báo cáo BI, tuyệt đối không được ảnh hưởng luồng chính.
+Sau khi phân tích bài toán (500k người dùng, 50k DAU, 3k–5k đơn/ngày, tăng trưởng 3–5 lần), chúng tôi lựa chọn **RabbitMQ** làm Message Broker trung tâm kết hợp với các mẫu thiết kế doanh nghiệp:
 
-### Các Vấn Đề Ở Kiến Trúc Synchronous REST (Legacy)
-* **Payment Timeout**: Khi Payment Service chậm hoặc lỗi, Order Service bị giữ connection dẫn đến HTTP 504 Timeout và sụt giảm thông lượng toàn hệ thống.
-* **Notification Latency**: Việc gửi email (250ms) và push (150ms) cộng dồn trực tiếp vào thời gian phản hồi của API Tạo đơn.
-* **Analytics Bottleneck**: Đợt bùng nổ traffic làm quá tải luồng phân tích, gây nghẽn luồng đặt hàng của khách.
-* **Tightly Coupled & Duplicated Retry**: Các service phụ thuộc chặt chẽ qua HTTP calls; code retry nằm rải rác và khó kiểm soát.
+1. **Tách rời luồng xử lý (Decoupling & Asynchronous Processing):** API Gateway tiếp nhận request và Order Service phản hồi ngay `HTTP 202 Accepted` trong **< 30ms**, không bị giữ kết nối bởi Payment hay downstream services.
+2. **Saga Choreography Pattern:** Điều phối giao dịch phân tán giữa Order, Inventory và Payment; tự động kích hoạt **Compensating Transaction (Hoàn kho)** nếu thanh toán thất bại sau tối đa 3 lần thử lại.
+3. **Transactional Outbox Pattern:** Đồng bộ trạng thái đơn hàng và sự kiện Outbox trong cùng một SQL Transaction nguyên tử, giải quyết triệt để rủi ro *Dual-Write*.
+4. **Atomic Inventory Reservation:** Trừ tồn kho nguyên tử tại tầng Database (`WHERE stock >= qty`), chống hoàn toàn tình trạng **Overselling (Bán âm kho)**.
+5. **Dead Letter Exchange (DLX) & Exponential Retry:** Tự động thử lại thanh toán qua hàng đợi có độ trễ (TTL 3s) và chuyển vào Parking Queue an toàn khi vượt ngưỡng.
 
----
-
-## 2. So Sánh Công Nghệ: RabbitMQ vs. Apache Kafka vs. Apache ActiveMQ
-
-Yêu cầu bài toán đòi hỏi lựa chọn và chứng minh công nghệ Message Queue phù hợp nhất giữa **RabbitMQ**, **Kafka**, và **ActiveMQ**:
-
-### Bảng Ma Trận So Sánh Kỹ Thuật
-
-| Tiêu chí Đánh giá | RabbitMQ | Apache Kafka | Apache ActiveMQ |
-| :--- | :--- | :--- | :--- |
-| **Mô hình cốt lõi (Core Paradigm)** | **Smart Broker / Dumb Consumer** (Message-oriented) | **Dumb Broker / Smart Consumer** (Distributed Log Streaming) | **JMS Message Broker** (Traditional Broker) |
-| **Định tuyến tin nhắn (Routing)** | **Rất mạnh (Flexible Exchanges)**: Topic (`#`, `*`), Direct, Fanout, Headers | Hạn chế (Dựa vào Topic Key partition, cần Stream processor) | Trung bình (JMS Queue & Topic) |
-| **Cơ chế Retry & Dead Letter (DLQ)** | **Xuất sắc**: Hỗ trợ native Dead Letter Exchange (DLX) + Message TTL | Phức tạp: Cần tạo riêng retry-topics và quản lý offset commit thủ công | Hỗ trợ qua RedeliveryPlugin & DLQ |
-| **Phân phối công việc (Work Distribution)** | **Cân bằng tải tin nhắn linh hoạt**: Hỗ trợ Competing Consumers, Fair dispatching (`prefetch`) | Cố định theo Partition (Số consumer tối đa = Số partitions) | Hỗ trợ Competing Consumers |
-| **Độ trễ xử lý (Latency)** | **Cực thấp (Sub-millisecond)** | Thấp (Tối ưu cho batching high-throughput) | Trung bình |
-| **Event Replay / Stream Processing** | Hạn chế (Tin nhắn bị xóa sau khi ACK) | **Xuất sắc**: Lưu trữ phân tán, hỗ trợ tua lại (Replay) từ offset | Hạn chế |
-| **Độ phức tạp vận hành (Ops Overhead)**| **Trung bình**: Triển khai nhẹ qua Erlang/Docker, UI trực quan | **Cao**: Cần ZooKeeper / KRaft, cấu hình phân vùng và quản trị cluster phức tạp | Trung bình |
-| **Độ phù hợp bài toán Techlab** | **RẤT CAO (Tối ưu nhất)** | Có thể dùng nhưng gây Over-engineering | Khả thi nhưng công nghệ cũ hơn |
-
-### Luận Điểm Lựa Chọn RabbitMQ:
-1. **Bản chất bài toán**: Hệ thống cần **Transactional Work Queue** (giao việc, xử lý thanh toán, giữ kho, gửi thông báo) với độ trễ phản hồi tức thì (<30ms) và định tuyến linh hoạt theo từng sự kiện.
-2. **Khả năng Retry/DLQ tích hợp**: RabbitMQ cung cấp cơ chế DLX và TTL Queues tự nhiên, cho phép thử lại thanh toán 3 lần mà không phải viết thêm hàng trăm dòng code quản lý offset như Kafka.
-3. **Độc lập tỷ lệ mở rộng (Independent Scaling)**: Có thể scale số lượng worker tiêu thụ của từng queue độc lập với nhau mà không bị bó buộc bởi số lượng partitions như Kafka.
-
----
-
-## 3. Kiến Trúc Đề Xuất (Proposed Event-Driven Architecture)
+### Sơ Đồ Kiến Trúc Hệ Thống
 
 ```
-[Client / Frontend]
-        │
-        ▼ (Port 3000 - Bearer Token Auth / Rate Limit / Correlation ID)
-┌─────────────────────────────────────────────────────────────────────────┐
-│                              API GATEWAY                                │
-└──────────┬──────────────────┬──────────────────┬────────────────────────┘
-           │                  │                  │
-           ▼                  ▼                  ▼
-    ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
-    │Order Service │   │Inventory Svc │   │Payment Svc   │
-    │ (Port 3001)  │   │ (Port 3003)  │   │ (Port 3002)  │
-    └──────┬───────┘   └──────┬───────┘   └──────┬───────┘
-           │                  │                  │
-           │ (Transactional   │ (Atomic SQL      │ (Idempotency
-           │  Outbox)         │  Lock)           │  Store)
-           ▼                  ▼                  ▼
-    ┌────────────────────────────────────────────────────┐
-    │                POSTGRESQL DATABASE                 │
-    │  orders | outbox_events | inventory | payments     │
-    └─────────────────────────┬──────────────────────────┘
-                              │
-                              ▼
-    ┌────────────────────────────────────────────────────┐
-    │               RABBITMQ MESSAGE BROKER              │
-    │                                                    │
-    │  • orders.topic:                                   │
-    │      - order.created    ──> [inventory.queue]      │
-    │      - inventory.reserved ─> [payment.queue]       │
-    │      - payment.success  ──> [order.status.queue]   │
-    │      - payment.failed   ──> [inventory.queue]      │
-    │      - inventory.failed ──> [order.status.queue]   │
-    │                                                    │
-    │  • notifications.fanout:                           │
-    │      ──> [email.notification.queue] (Non-blocking) │
-    │      ──> [push.notification.queue]  (Non-blocking) │
-    │                                                    │
-    │  • payment.dlx:                                    │
-    │      ──> [payment.retry.queue] (TTL 3s)            │
-    │      ──> [payment.parking.queue] (Exhausted)       │
-    └────────────────────────────────────────────────────┘
+                     [ CLIENT / FRONTEND ]
+                               │
+                               ▼ (Port 3000: Bearer Token Auth / Rate Limiting / Trace ID)
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                                      API GATEWAY                                       │
+└───────────────┬───────────────────────────────┬───────────────────────────────┬────────┘
+                │                               │                               │
+                ▼                               ▼                               ▼
+     ┌────────────────────┐          ┌────────────────────┐          ┌────────────────────┐
+     │   Order Service    │          │ Inventory Service  │          │  Payment Service   │
+     │    (Port 3001)     │          │    (Port 3003)     │          │    (Port 3002)     │
+     └──────────┬─────────┘          └──────────┬─────────┘          └──────────┬─────────┘
+                │                               │                               │
+                │ (Transactional                │ (Atomic SQL                   │ (Idempotency
+                │  Outbox Pattern)              │  Stock Lock)                  │  Key Store)
+                ▼                               ▼                               ▼
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                                  POSTGRESQL DATABASE                                   │
+│                  orders | outbox_events | inventory | payments | reservations          │
+└───────────────────────────────────────────────┬────────────────────────────────────────┘
+                                                │
+                                                ▼ (Transactional Outbox Dispatcher)
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                                RABBITMQ MESSAGE BROKER                                 │
+│                                                                                        │
+│  • orders.topic (Topic Exchange)                                                       │
+│       ├── order.created        ───► [ inventory.queue ]                                │
+│       ├── inventory.reserved   ───► [ payment.queue ]                                  │
+│       ├── payment.success      ───► [ order.status.queue ]                             │
+│       ├── payment.failed       ───► [ inventory.queue ] (Saga Compensation Release)    │
+│       ├── inventory.failed     ───► [ order.status.queue ] (Mark Order FAILED)         │
+│       └── order.#              ───► [ analytics.queue ] (BI Event Ingestion)           │
+│                                                                                        │
+│  • notifications.fanout (Fanout Exchange)                                              │
+│       ├── (Broadcast)          ───► [ email.notification.queue ]                       │
+│       └── (Broadcast)          ───► [ push.notification.queue ]                        │
+│                                                                                        │
+│  • payment.dlx (Dead Letter Exchange)                                                  │
+│       ├── payment.retry        ───► [ payment.retry.queue ] (TTL 3s Retry)             │
+│       └── (Max 3 Retries)      ───► [ payment.parking.queue ] (Permanent Failure)      │
+└────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 4. Chu Trình Saga Choreography & Xử Lý Concurrency
+## 2. Mục Lục Tài Liệu Chi Tiết (Documentation)
 
-### A. Chu Trình Saga Tuần Tự An Toàn:
-```
-1. Client POST /orders ──> Order Service tạo Order (PENDING) + Outbox Event ──> Trả về 202 Accepted (<30ms)
-2. Outbox Worker publish 'order.created' lên 'orders.topic'
-3. Inventory Service nhận 'order.created':
-     ├── Trường hợp ĐỦ hàng:
-     │     ├── Trừ kho nguyên tử (Atomic SQL)
-     │     └── Publish 'inventory.reserved'
-     │
-     └── Trường hợp HẾT hàng:
-           ├── Publish 'inventory.failed'
-           └── Order Service cập nhật Order = FAILED (Payment KHÔNG bao giờ bị kích hoạt!)
+Để xem phân tích kỹ thuật chuyên sâu và hướng dẫn cài đặt từng môi trường, vui lòng tham khảo các tài liệu sau:
 
-4. Payment Service nhận 'inventory.reserved':
-     ├── Trường hợp Thanh toán THÀNH CÔNG:
-     │     ├── Ghi nhận Payment SUCCESS
-     │     ├── Publish 'payment.success' ──> Order cập nhật = PAID
-     │     └── Publish Fanout ──> Gửi Email & Push Notification
-     │
-     └── Trường hợp Thanh toán THẤT BẠI:
-           ├── Retry 3 lần qua DLX + TTL Queue (3s)
-           └── Nếu quá 3 lần:
-                 ├── Đẩy vào payment.parking.queue
-                 ├── Publish 'payment.failed'
-                 ├── Inventory Service nhận 'payment.failed' ──> Tự động HOÀN KHO (Release Stock)
-                 └── Order Service cập nhật Order = FAILED
-```
-
-### B. Chống Race Condition trong Inventory:
-Sử dụng câu lệnh SQL trừ kho nguyên tử tại tầng PostgreSQL:
-```sql
-UPDATE inventory
-SET stock = stock - $1, updated_at = CURRENT_TIMESTAMP
-WHERE product_id = $2 AND stock >= $1
-RETURNING stock;
-```
-Kết hợp với ràng buộc `UNIQUE (order_id, product_id)` trong bảng `inventory_reservations`, đảm bảo **không bao giờ xảy ra tình trạng Overselling (Bán âm kho)** ngay cả khi scale nhiều pod/instance.
+* 📄 **[SOLUTION_REPORT.md](./SOLUTION_REPORT.md)**: **Báo cáo kỹ thuật chi tiết & Thực nghiệm đối chứng**
+  * Ma trận so sánh lý thuyết: **RabbitMQ** vs **Kafka** vs **ActiveMQ**.
+  * Mermaid Sequence Diagram chu trình Saga, Compensating Transaction & DLQ.
+  * Bảng số liệu đo đạc thực nghiệm (Giảm 98.6% p95 Latency, Throughput tăng 114 lần, 0% lỗi).
+  * Đánh giá Trade-offs & chuẩn bị cho môi trường Production.
+* 🛠️ **[SETUP_GUIDE.md](./SETUP_GUIDE.md)**: **Sổ tay hướng dẫn cài đặt & khởi chạy từ A–Z**
+  * Hướng dẫn chi tiết từng bước cho máy tính mới (Windows, macOS, Linux).
+  * 3 phương thức khởi chạy: Docker Compose, In-Memory Local Mode, và Kubernetes.
+  * Hướng dẫn gọi thử nghiệm API (cURL, Postman) và khắc phục sự cố (Troubleshooting).
 
 ---
 
-## 5. Hướng Dẫn Khởi Chạy Nhanh (Quick Start)
+## 3. Hướng Dẫn Cài Đặt & Khởi Chạy Nhanh (Quick Start)
 
-### 1. Khởi chạy toàn bộ hệ thống bằng Docker Compose (Khuyên dùng)
+### 1. Yêu Cầu Cài Đặt
+* **Node.js**: v18.x hoặc v20.x+
+* **Docker & Docker Compose** (hoặc chạy qua In-Memory mode không cần cài DB)
+
+### 2. Thiết Lập Môi Trường
+```bash
+# 1. Cài đặt dependencies
+npm install
+
+# 2. Tạo file cấu hình môi trường từ file mẫu
+cp .env.example .env
+```
+
+### 3. Khởi Chạy Bằng Docker Compose (Khuyên dùng 🌟)
 ```bash
 docker compose up --build -d
 ```
 Hệ thống sẽ bật 8 containers:
-* **API Gateway**: `http://localhost:3000` (Auth Header: `Authorization: Bearer techlab-secret-token-2026`)
+* **API Gateway**: `http://localhost:3000` (Header: `Authorization: Bearer techlab-secret-token-2026`)
 * **RabbitMQ Management UI**: `http://localhost:15672` (`guest` / `guest`)
-* **PostgreSQL Database**: `localhost:5432` (`postgres` / `postgres` - Database: `techlab_db`)
-* **5 Backend Services**: Order, Payment, Inventory, Notification, Analytics.
+* **PostgreSQL Database**: `localhost:5432` (`postgres` / `postgres`)
+* **5 Backend Services**: Order (3001), Payment (3002), Inventory (3003), Notification (3004), Analytics (3005).
+
+*(Nếu máy chưa cài Docker, chỉ cần chạy `node runner.js` để tự động bật 6 services bằng In-Memory Store).*
 
 ---
 
-### 2. Chạy Toàn Bộ 23 Automated Tests
+## 4. Chạy Kiểm Thử & Đo Đạc Hiệu Năng (Testing & Benchmark)
+
+### 1. Chạy 25 Automated Tests
+Bộ test độc lập kiểm thử toàn diện Gateway, Saga, Outbox, Concurrency và DLQ:
 ```bash
 npm test
 ```
-Bộ test bao gồm:
-* `tests/gateway.test.js`: Kiểm thử Token Auth, Rate Limiting, Correlation ID Injection.
-* `tests/inventory-concurrency.test.js`: Kiểm thử Race Condition đa luồng (20 request tranh 5 sản phẩm).
-* `tests/order-saga.test.js`: Kiểm thử luồng Async và chuyển đổi trạng thái Saga (`PAID` vs `FAILED`).
-* `tests/outbox.test.js`: Kiểm thử Transactional Outbox.
-* `tests/payment-dlq.test.js`: Kiểm thử Dead Letter Exchange (DLX) và Idempotency.
-
----
-
-### 3. Chạy Toàn Bộ 6 Microservices và Dual-Metric Benchmark
+Hoặc xem chi tiết từng bước kiểm thử:
 ```bash
-node runner.js
+npm run test:verbose
+```
+
+### 2. Chạy Benchmark Đo Đạc Đối Chứng (Sync REST vs Async RabbitMQ)
+```bash
+npm run benchmark:all
 ```
 
 ---
 
-## 6. Kết Quả Đo Lường Thực Nghiệm (Dual-Metric Benchmark)
-
-Chạy thực nghiệm so sánh với 50 requests tải đồng thời:
+## 5. Cấu Trúc Thư Mục Dự Án (Project Structure)
 
 ```
-========================================================================
-       DUAL-METRIC BENCHMARK COMPARISON (SYNC vs ASYNC)
-========================================================================
-┌─────────┬────────────────────────────────┬───────────────────────────────┬───────────────────────────────┐
-│ (index) │ Metric                         │ Sync REST (Legacy)            │ Async RabbitMQ (Proposed)     │
-├─────────┼────────────────────────────────┼───────────────────────────────┼───────────────────────────────┤
-│ 0       │ 'API Acceptance Success Rate'  │ '41/50' (18% Timeout/Error)   │ '50/50' (0% Error)            │
-│ 1       │ 'API Acceptance Error Rate'    │ '18.00%'                      │ '0.00%'                       │
-│ 2       │ 'API Throughput (RPS)'         │ '10.90 req/sec'               │ '1250.00 req/sec'             │
-│ 3       │ 'API Average Latency'          │ '1721.49 ms'                  │ '15.46 ms'                    │
-│ 4       │ 'API p95 Latency'              │ '1986 ms'                     │ '27 ms'                       │
-│ 5       │ 'Downstream Timeout Blocking'  │ 'Blocks Order Service (504s)' │ 'Non-blocking (202 Accepted)' │
-│ 6       │ 'Saga State Consistency'       │ 'Partial Failure Risk'        │ 'Safe Compensation & DLQ'     │
-└─────────┴────────────────────────────────┴───────────────────────────────┴───────────────────────────────┘
-
-🚀 PROOF: Async RabbitMQ reduced API p95 Latency by 98.6% while isolating downstream latency and ensuring Saga consistency!
+Test-Interview/
+├── benchmark/               # Công cụ đo đạc đối chứng latency, RPS và error rate
+│   └── load-test.js
+├── common/                  # Các module dùng chung (Database, Outbox, RabbitMQ Topology)
+│   ├── db.js
+│   ├── outbox.js
+│   └── rabbitmq.js
+├── k8s/                     # Kubernetes Manifests (Deployments, Services, ConfigMaps)
+│   ├── api-gateway.yaml
+│   ├── order-service.yaml
+│   ├── payment-service.yaml
+│   ├── inventory-service.yaml
+│   ├── notification-service.yaml
+│   ├── analytics-service.yaml
+│   ├── rabbitmq.yaml
+│   └── postgres.yaml
+├── services/                # Mã nguồn 6 Microservices độc lập
+│   ├── api-gateway/
+│   ├── order-service/
+│   ├── payment-service/
+│   ├── inventory-service/
+│   ├── notification-service/
+│   └── analytics-service/
+├── tests/                   # 25 Automated Tests
+│   ├── gateway.test.js
+│   ├── inventory-concurrency.test.js
+│   ├── order-saga.test.js
+│   ├── outbox.test.js
+│   └── payment-dlq.test.js
+├── docker-compose.yml       # Docker Compose Stack 8 containers
+├── runner.js                # Script khởi chạy đa tiến trình cho local dev
+├── README.md                # Tài liệu tổng quan & hướng dẫn nhanh
+├── SETUP_GUIDE.md           # Hướng dẫn chi tiết setup & troubleshooting
+└── SOLUTION_REPORT.md       # Báo cáo kỹ thuật chi tiết & dữ liệu benchmark
 ```
-
----
-
-## 7. Triển Khai Kubernetes Manifests (`k8s/`)
-
-Thư mục `k8s/` cung cấp đầy đủ manifests sẵn sàng deploy:
-* `k8s/namespace.yaml`
-* `k8s/configmap-secrets.yaml`
-* `k8s/rabbitmq.yaml`
-* `k8s/postgres.yaml`
-* `k8s/api-gateway.yaml`
-* `k8s/order-service.yaml`
-* `k8s/payment-service.yaml`
-* `k8s/inventory-service.yaml`
-* `k8s/notification-service.yaml`
-* `k8s/analytics-service.yaml`
-
-Các pods được cấu hình đầy đủ `readinessProbe`, `livenessProbe`, `resources` requests/limits và xử lý Graceful Shutdown khi nhận tín hiệu `SIGTERM`.

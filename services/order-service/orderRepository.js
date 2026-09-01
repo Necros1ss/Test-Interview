@@ -1,4 +1,4 @@
-const { query } = require('../../common/db');
+const { query, withTransaction } = require('../../common/db');
 const { saveOutboxEvent } = require('../../common/outbox');
 const { ROUTING_KEYS } = require('../../common/rabbitmq');
 
@@ -10,42 +10,60 @@ async function createOrderInDb(orderData) {
   const totalAmount = Math.max(0, parseFloat(orderData.amount || 150000));
   const correlationId = orderData.correlationId || null;
   const status = 'PENDING';
+  const createdAt = new Date().toISOString();
 
-  // 1. Insert Order
-  await query(
-    `INSERT INTO orders (id, user_id, status, total_amount, correlation_id, details)
-     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-    [orderId, userId, status, totalAmount, correlationId, JSON.stringify({ productId, quantity })]
-  );
+  // Atomically execute Order creation and Outbox Event creation within a single SQL transaction
+  return withTransaction(async (client) => {
+    // 1. Insert Order
+    await client.query(
+      `INSERT INTO orders (id, user_id, status, total_amount, correlation_id, details)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [orderId, userId, status, totalAmount, correlationId, JSON.stringify({ productId, quantity })]
+    );
 
-  // 2. Insert into Outbox for Transactional Outbox Pattern
-  await saveOutboxEvent('Order', orderId, ROUTING_KEYS.ORDER_CREATED, {
-    orderId,
-    userId,
-    productId,
-    quantity,
-    amount: totalAmount,
-    correlationId,
-    createdAt: new Date().toISOString()
+    // 2. Insert into Outbox for Transactional Outbox Pattern
+    await saveOutboxEvent(
+      'Order',
+      orderId,
+      ROUTING_KEYS.ORDER_CREATED,
+      {
+        orderId,
+        userId,
+        productId,
+        quantity,
+        amount: totalAmount,
+        correlationId,
+        createdAt
+      },
+      client
+    );
+
+    return {
+      orderId,
+      userId,
+      productId,
+      quantity,
+      amount: totalAmount,
+      status,
+      correlationId,
+      createdTime: createdAt
+    };
   });
-
-  return {
-    orderId,
-    userId,
-    productId,
-    quantity,
-    amount: totalAmount,
-    status,
-    correlationId,
-    createdTime: new Date().toISOString()
-  };
 }
 
-async function updateOrderStatusInDb(orderId, status, details = {}) {
-  const res = await query(
-    `UPDATE orders SET status = $1, details = $2 WHERE id = $3 RETURNING *`,
-    [status, JSON.stringify(details), orderId]
-  );
+async function updateOrderStatusInDb(orderId, status, details = {}, allowedSourceStates = null) {
+  let res;
+  if (allowedSourceStates && Array.isArray(allowedSourceStates) && allowedSourceStates.length > 0) {
+    res = await query(
+      `UPDATE orders SET status = $1, details = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3 AND status = ANY($4::varchar[]) RETURNING *`,
+      [status, JSON.stringify(details), orderId, allowedSourceStates]
+    );
+  } else {
+    res = await query(
+      `UPDATE orders SET status = $1, details = $2 WHERE id = $3 RETURNING *`,
+      [status, JSON.stringify(details), orderId]
+    );
+  }
   return res.rows && res.rows.length > 0 ? res.rows[0] : null;
 }
 

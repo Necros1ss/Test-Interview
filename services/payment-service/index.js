@@ -70,8 +70,9 @@ async function startAsyncConsumer() {
       try {
         orderData = JSON.parse(msg.content.toString());
       } catch (parseErr) {
-        console.error('[Payment Service] Malformed message body. Rejecting:', parseErr.message);
-        return channel.nack(msg, false, false);
+        console.error('[Payment Service] Malformed message body. Moving directly to parking queue:', parseErr.message);
+        channel.sendToQueue(QUEUES.PAYMENT_PARKING, msg.content, { persistent: true });
+        return channel.ack(msg);
       }
 
       const orderId = orderData.orderId;

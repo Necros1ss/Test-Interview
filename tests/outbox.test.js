@@ -40,4 +40,24 @@ test('Transactional Outbox Test Suite', async (t) => {
     assert.equal(res.rows.length, 1);
     assert.equal(res.rows[0].status, 'PUBLISHED');
   });
+
+  await t.test('3. createOrderInDb executes atomically via withTransaction', async () => {
+    const { createOrderInDb } = require('../services/order-service/orderRepository');
+    const order = await createOrderInDb({
+      orderId: 'ORD-TX-ATOMIC-01',
+      userId: 'usr-tx',
+      productId: 'prod-abc',
+      quantity: 3,
+      amount: 450000
+    });
+
+    assert.equal(order.orderId, 'ORD-TX-ATOMIC-01');
+
+    const orderDb = await query(`SELECT * FROM orders WHERE id = $1`, ['ORD-TX-ATOMIC-01']);
+    assert.equal(orderDb.rows.length, 1);
+
+    const outboxDb = await query(`SELECT * FROM outbox_events WHERE aggregate_id = $1`, ['ORD-TX-ATOMIC-01']);
+    assert.equal(outboxDb.rows.length, 1);
+    assert.equal(outboxDb.rows[0].status, 'PENDING');
+  });
 });

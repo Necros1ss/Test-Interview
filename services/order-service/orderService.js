@@ -5,12 +5,12 @@ const {
   getAllOrdersFromDb
 } = require('./orderRepository');
 
-// State Machine definition
-const VALID_TRANSITIONS = {
-  PENDING: ['PAID', 'FAILED', 'CANCELLED'],
-  PAID: ['REFUNDED'],
-  FAILED: [],
-  CANCELLED: []
+// Valid source states mapped to target state
+const ALLOWED_SOURCE_STATES = {
+  PAID: ['PENDING'],
+  FAILED: ['PENDING'],
+  CANCELLED: ['PENDING'],
+  REFUNDED: ['PAID']
 };
 
 async function handleCreateOrder(orderData) {
@@ -18,25 +18,34 @@ async function handleCreateOrder(orderData) {
 }
 
 async function handleOrderStatusUpdate(orderId, nextStatus, details = {}) {
-  const current = await getOrderFromDb(orderId);
-  if (!current) {
-    console.warn(`[Order Service] Order ${orderId} not found for status update.`);
+  const allowedSources = ALLOWED_SOURCE_STATES[nextStatus] || [];
+  if (allowedSources.length === 0) {
+    console.warn(`[Order Service] Unsupported target state transition: ${nextStatus}`);
     return null;
   }
 
-  const allowed = VALID_TRANSITIONS[current.status] || [];
-  if (!allowed.includes(nextStatus)) {
-    console.warn(`[Order Service] Invalid state transition for Order ${orderId}: ${current.status} -> ${nextStatus}`);
+  // Atomic conditional update in database to prevent Read-Modify-Write Race Condition
+  const updated = await updateOrderStatusInDb(
+    orderId,
+    nextStatus,
+    {
+      ...details,
+      transitionedAt: new Date().toISOString()
+    },
+    allowedSources
+  );
+
+  if (!updated) {
+    const current = await getOrderFromDb(orderId);
+    if (!current) {
+      console.warn(`[Order Service] Order ${orderId} not found for status update.`);
+      return null;
+    }
+    console.warn(`[Order Service] Order ${orderId} transition to ${nextStatus} skipped (Current status: ${current.status}).`);
     return current;
   }
 
-  const updated = await updateOrderStatusInDb(orderId, nextStatus, {
-    ...(current.details || {}),
-    ...details,
-    transitionedAt: new Date().toISOString()
-  });
-
-  console.log(`[Order Service] Order ${orderId} status transitioned: ${current.status} -> ${nextStatus}`);
+  console.log(`[Order Service] Order ${orderId} status transitioned to: ${nextStatus}`);
   return updated;
 }
 

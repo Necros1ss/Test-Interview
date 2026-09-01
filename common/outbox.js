@@ -5,9 +5,10 @@ const { publishEvent, EXCHANGES } = require('./rabbitmq');
 let outboxTimer = null;
 let isDispatching = false;
 
-async function saveOutboxEvent(aggregateType, aggregateId, eventType, payload) {
+async function saveOutboxEvent(aggregateType, aggregateId, eventType, payload, dbClient = null) {
   const eventId = `EVT-${uuidv4()}`;
-  await query(
+  const queryFn = dbClient ? (text, params) => dbClient.query(text, params) : query;
+  await queryFn(
     `INSERT INTO outbox_events (id, aggregate_type, aggregate_id, event_type, payload, status)
      VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
     [eventId, aggregateType, aggregateId, eventType, JSON.stringify(payload), 'PENDING']

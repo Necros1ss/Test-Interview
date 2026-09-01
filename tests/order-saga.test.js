@@ -29,24 +29,43 @@ test('Order Service & Saga Choreography Test Suite', async (t) => {
   });
 
   await t.test('1. Input validation rejects invalid order payload with HTTP 400', async () => {
+    // 1a. Empty payload
+    const resEmpty = await fetch(`${BASE_URL}/orders`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+    assert.equal(resEmpty.status, 400);
+
+    // 1b. Missing productId
+    const resNoProd = await fetch(`${BASE_URL}/orders`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ quantity: 1, amount: 100000 })
+    });
+    assert.equal(resNoProd.status, 400);
+
+    // 1c. Negative quantity
     const res1 = await fetch(`${BASE_URL}/orders`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ quantity: -5, amount: 100000 })
+      body: JSON.stringify({ productId: 'prod-abc', quantity: -5, amount: 100000 })
     });
     assert.equal(res1.status, 400);
 
+    // 1d. Negative amount
     const res2 = await fetch(`${BASE_URL}/orders`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ quantity: 1, amount: -100 })
+      body: JSON.stringify({ productId: 'prod-abc', quantity: 1, amount: -100 })
     });
     assert.equal(res2.status, 400);
 
+    // 1e. Empty string productId
     const res3 = await fetch(`${BASE_URL}/orders`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ quantity: 1, amount: 100000, productId: '' })
+      body: JSON.stringify({ productId: '   ', quantity: 1, amount: 100000 })
     });
     assert.equal(res3.status, 400);
   });
@@ -123,5 +142,36 @@ test('Order Service & Saga Choreography Test Suite', async (t) => {
     const updated = await getOrder(orderId);
     assert.equal(updated.status, 'FAILED');
     assert.equal(updated.details.reason, 'INSUFFICIENT_STOCK');
+  });
+
+  await t.test('5. Atomic State Machine: Rejects invalid transition (PAID -> FAILED)', async () => {
+    const createRes = await fetch(`${BASE_URL}/orders?mode=async`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ productId: 'prod-abc', quantity: 1, amount: 150000 })
+    });
+    const { orderId } = await createRes.json();
+
+    // First transition: PENDING -> PAID
+    await publishEvent(EXCHANGES.ORDERS_TOPIC, ROUTING_KEYS.PAYMENT_SUCCESS, {
+      orderId,
+      status: 'PAID',
+      transactionId: 'TXN-SAFE-01'
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    const paidOrder = await getOrder(orderId);
+    assert.equal(paidOrder.status, 'PAID');
+
+    // Attempt invalid transition: PAID -> FAILED
+    await publishEvent(EXCHANGES.ORDERS_TOPIC, ROUTING_KEYS.PAYMENT_FAILED, {
+      orderId,
+      status: 'FAILED',
+      reason: 'LATE_FAILURE_EVENT'
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    const finalOrder = await getOrder(orderId);
+    assert.equal(finalOrder.status, 'PAID', 'Order status must remain PAID, rejecting illegal transition to FAILED');
   });
 });

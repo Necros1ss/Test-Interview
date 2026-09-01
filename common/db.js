@@ -218,14 +218,27 @@ async function query(text, params = []) {
     return { rows: [order], rowCount: 1 };
   }
 
-  // 8. UPDATE orders SET status = $1
+  // 8. UPDATE orders SET status (handles both basic and atomic conditional updates)
   if (sql.includes('UPDATE orders SET status')) {
-    const [status, details, orderId] = params;
+    let status, details, orderId, allowedStatuses;
+    if (params.length === 3) {
+      [status, details, orderId] = params;
+    } else if (params.length >= 4) {
+      // e.g. [nextStatus, detailsJson, orderId, allowedSourceStatesArray]
+      [status, details, orderId, allowedStatuses] = params;
+    }
+
     const order = memoryStore.orders.get(orderId);
     if (order) {
+      if (allowedStatuses && Array.isArray(allowedStatuses)) {
+        if (!allowedStatuses.includes(order.status)) {
+          return { rows: [], rowCount: 0 };
+        }
+      }
       order.status = status;
       if (details) {
-        order.details = { ...(order.details || {}), ...(typeof details === 'string' ? JSON.parse(details) : details) };
+        const parsedDetails = typeof details === 'string' ? JSON.parse(details) : details;
+        order.details = { ...(order.details || {}), ...parsedDetails };
       }
       order.updated_at = new Date().toISOString();
       return { rows: [order], rowCount: 1 };
@@ -292,6 +305,12 @@ async function query(text, params = []) {
     return { rows: [], rowCount: 0 };
   }
 
+  if (sql.includes('FROM outbox_events WHERE aggregate_id =') || sql.includes('FROM outbox_events WHERE aggregate_id=')) {
+    const aggId = params[0];
+    const matching = Array.from(memoryStore.outbox.values()).filter((e) => e.aggregate_id === aggId);
+    return { rows: matching, rowCount: matching.length };
+  }
+
   if (sql.includes('FROM outbox_events WHERE id =') || sql.includes('FROM outbox_events WHERE id=')) {
     const id = params[0];
     const evt = memoryStore.outbox.get(id);
@@ -305,6 +324,44 @@ async function query(text, params = []) {
   }
 
   return { rows: [], rowCount: 0 };
+}
+
+async function withTransaction(callback) {
+  if (!useMemoryStore && pool) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await callback(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  // Memory store transaction simulation with snapshot rollback
+  const ordersSnapshot = new Map(memoryStore.orders);
+  const outboxSnapshot = new Map(memoryStore.outbox);
+  const reservationsSnapshot = new Map(memoryStore.reservations);
+  const inventorySnapshot = new Map(memoryStore.inventory);
+  const paymentsSnapshot = new Map(memoryStore.payments);
+
+  try {
+    const fakeClient = { query };
+    const result = await callback(fakeClient);
+    return result;
+  } catch (err) {
+    // Rollback memory store snapshots on error
+    memoryStore.orders = ordersSnapshot;
+    memoryStore.outbox = outboxSnapshot;
+    memoryStore.reservations = reservationsSnapshot;
+    memoryStore.inventory = inventorySnapshot;
+    memoryStore.payments = paymentsSnapshot;
+    throw err;
+  }
 }
 
 async function closeDb() {
@@ -321,6 +378,7 @@ function resetDb() {
 module.exports = {
   initDb,
   query,
+  withTransaction,
   closeDb,
   resetDb,
   memoryStore

@@ -68,16 +68,33 @@ async function initService() {
 
 // Input Validation Middleware
 function validateOrderPayload(req, res, next) {
-  const { quantity, amount, productId } = req.body || {};
-  if (quantity !== undefined && (typeof quantity !== 'number' || quantity <= 0 || !Number.isInteger(quantity))) {
-    return res.status(400).json({ error: 'Quantity must be a positive integer.' });
+  if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body) || Object.keys(req.body).length === 0) {
+    return res.status(400).json({ error: 'Request body must be a non-empty JSON object.' });
   }
-  if (amount !== undefined && (typeof amount !== 'number' || amount <= 0)) {
-    return res.status(400).json({ error: 'Amount must be a positive number.' });
+
+  const { quantity, amount, productId, userId } = req.body;
+  const errors = [];
+
+  if (!productId || typeof productId !== 'string' || !productId.trim()) {
+    errors.push('productId is required and must be a non-empty string.');
   }
-  if (productId !== undefined && (typeof productId !== 'string' || !productId.trim())) {
-    return res.status(400).json({ error: 'ProductId must be a non-empty string.' });
+
+  if (quantity === undefined || typeof quantity !== 'number' || quantity <= 0 || !Number.isInteger(quantity)) {
+    errors.push('quantity is required and must be a positive integer.');
   }
+
+  if (amount === undefined || typeof amount !== 'number' || amount <= 0 || Number.isNaN(amount) || !Number.isFinite(amount)) {
+    errors.push('amount is required and must be a positive finite number.');
+  }
+
+  if (userId !== undefined && (typeof userId !== 'string' || !userId.trim())) {
+    errors.push('userId, if provided, must be a non-empty string.');
+  }
+
+  if (errors.length > 0) {
+    return res.status(400).json({ error: 'Validation Error', details: errors });
+  }
+
   next();
 }
 
